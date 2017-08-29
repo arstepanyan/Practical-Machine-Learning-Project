@@ -1,0 +1,288 @@
+---
+title: "Predicting the Manner of Activity"
+author: "Araks Stepanyan"
+date: "8/29/2017"
+output: html_document
+---
+
+## Summary
+
+The goal of this project is to predict the manner in which 6 individuals perform barbell lift. They did the lifts correctly and incorrectly in 5 different ways. We are going to use data from sensors in the users' glove, armband, lumbar belt and dumbbell. The data for this project come from this source(find paper in Reference):
+[http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har]()  
+
+For computational efficiency we use H2O package in R. It’s free to use and instigates faster computation (see Reference).    
+
+We divided our data into training, validation and testing sets. We used training data to fit two random forest and two boosting models. Validation test was used to compare classification errors and select the best model. The second boosing model with a little parameter tuning was selected as the best model. Testing data was then used to predict and check the accuracy. The accuracy on testing data was pretty close to the accuracy on validation data, indicating that we didn't overfit the data.  
+
+**Note.** You can skip the first two parts and start viewing from the **Model Selection**. Before model selection we are just loading data and deleting the columns which were derived from the rest of the columns, as well as those columns which are id or time.      
+
+## Download and Read Data
+
+```{r download_data}
+if(!file.exists("Machine_Learning_Progect")){dir.create("Mach_Learning_Project")}
+
+trainUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(trainUrl, 
+              destfile = "./Mach_Learning_Project/train_data.csv", 
+              method = "curl")
+
+testUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(testUrl, 
+              destfile = "./Mach_Learning_Project/test_data.csv", 
+              method = "curl")
+```
+
+```{r reading_data}
+library("data.table")
+options(datatable.fread.datatable=FALSE)
+training <- fread("./Mach_Learning_Project/train_data.csv", stringsAsFactors = T)
+testing <- fread("./Mach_Learning_Project/test_data.csv", stringsAsFactors = T)
+```
+
+## Exploratory Analysis
+
+Look into training data.  
+```{r training_data}
+dim(training)
+sum(is.na(training))
+```
+
+We have `r nrow(training)` training examples and a huge amount of missing values, `r sum(is.na(training))`.   
+
+### Missing Values  
+
+By uncommenting the third line of code bellow, we see the names of the columns containing NA values. It turns out that those columns are all derived features. From the corresponding paper(in Reference), we know that there are 96 derived features*.  
+```{r missing_calue_columns}
+na_columns <- names(training[,colSums(is.na(training)) > 0])
+length(na_columns)
+#na_columns
+```
+
+Looks like of 96 derived features, `r length(na_columns)` contain NA values.  
+* The paper says, *"In each step of the sliding window approach we calculated features on the Euler angles (**roll**, **pitch** and **yaw**), as well as the raw **accelerometer**, **gyroscope** and **magnetometer** readings. For the Euler angles of each of the four sensors we calculated eight features: **mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness**, generating in total 96 derived feature sets."*
+
+### Omitting variables  
+
+We will omit the 96 columns discussed above.  
+
+```{r NA_columns_1}
+columns_to_remove_1 <-
+        grep("avg|var|stddev|max|min|amplitude|kurtosis|skewness",
+             names(training))
+length(columns_to_remove_1)
+```
+
+Notice that the number of columns that contain the keywords **"avg", "var", "stddev", "max", "min", "amplitude", "kurtosis", "skewness"** is actually `r length(columns_to_remove_1)` instead of expected 96. From these 100 columns let's have a look at those not containings words **roll**, **pitch** and **yaw**.  
+```{r NA_columns_2}
+columns_to_remove_2 <- !grepl("roll|pitch|yaw",
+                            names(training[,columns_to_remove_1]))
+names(training[,columns_to_remove_1][,columns_to_remove_2])
+```
+
+We see  
+1. *"pitch"* is incorrectly entered as *"picth"* in `r length(grep("picth",names(training[,columns_to_remove_1][,columns_to_remove_2])))` columns. We still want to remove those.  
+2. The columns not containing either of **roll, pitch** or **yaw** are again derived quantities. We will remove those as well.  
+
+We will also omit the id and time variables, as we don't want to predict the manner of the exercise based on who did it or the timestep.  
+
+```{r omit_columns_1}
+training_1 <- training[,!names(training) %in% c("V1","user_name", "raw_timestamp_part_1", "raw_timestamp_part_2","cvtd_timestamp","new_window", "num_window",names(training[,columns_to_remove_1]))]
+dim(training_1)
+```
+
+Final check to see that we don't have any NAs.  
+```{r remaining_columns}
+#names(training_1)
+sum(is.na(training_1))
+```
+
+## Model Selection
+
+### H2O
+
+Install and start H2o.  
+```{r starting_h2o, message = F, include = F}
+if(!"h2o" %in% rownames(installed.packages())){
+        install.packages("h2o")}
+library(h2o)
+
+# -1: use all available threads and allocate memory to the cluster,
+# the cluster size should be about 4 times larger than your dataset 
+h2o.init(nthreads = -1, max_mem_size = '1G')
+
+# disable progress bar so it doesn't clutter up the document
+h2o.no_progress()
+```
+
+```{r splitting_data}
+training.h2o <- as.h2o(training_1)     # convert data frame into h2o Frame
+splits <- h2o.splitFrame(training.h2o, 
+                         c(0.6, 0.2), seed = 1234 )     # split for cross validation
+# assign a h2o id names to the splits 
+train <- h2o.assign( splits[[1]], "train" )  
+valid <- h2o.assign( splits[[2]], "valid" )
+test  <- h2o.assign( splits[[3]], "test" )
+
+dependant <- 53                         # index of variable classe
+independant <- c(1:52)                  # indices of predictors
+```
+
+### Random Forest 1
+
+With default number of trees of 50 and default maximum depth of 20.  
+
+```{r random_forest_1}
+rf1 <- h2o.randomForest(
+        training_frame = train,
+        validation_frame = valid,
+        x = independant,
+        y = dependant,
+        model_id = "rf_classe_v1",
+        stopping_rounds = 2,
+        score_each_iteration = T,
+        seed = 1000000
+)
+```
+
+#### Performance
+```{r rf1_performance, echo = F}
+# summary(rf1)
+h2o.hit_ratio_table(rf1, valid = TRUE)[1, 2]
+h2o.confusionMatrix(rf1, valid = TRUE) 
+h2o.confusionMatrix(rf1, valid = FALSE)
+```
+* **Accuracy** of the model on validation data is `r round(h2o.hit_ratio_table(rf1, valid = TRUE)[1, 2],4)`. 
+* **Classification error** of validation data is `r round(h2o.confusionMatrix(rf1, valid = TRUE)[6,6],4)`.  
+* **Out of bag error** is `r round(h2o.confusionMatrix(rf1, valid = FALSE)[6,6],4)`.  
+
+These results are already quite good but we will improve them farther.  
+(For the rest of the models we will not print the whole Confusion matrix)  
+
+### Random Forest 2
+
+Increase number of trees and maximum depth.  
+
+```{r random_forest_2}
+rf2 <- h2o.randomForest( 
+	training_frame = train,
+	validation_frame = valid,
+	x = independant,
+	y = dependant,
+	model_id = "rf_classe_v2",
+	ntrees = 200,
+	max_depth = 30, 
+	stopping_rounds = 2,
+	score_each_iteration = TRUE,
+	seed = 3000000 
+)
+```
+
+#### Performance of the two random forest models
+
+```{r rf2_performance, echo = F}
+paste("Random Forest (model 1).",
+      "Accuracy:", round(h2o.hit_ratio_table(rf1, valid = TRUE)[1, 2],4),
+      ", Classification Error:",round(h2o.confusionMatrix(rf1, valid = TRUE)[6,6], 4),
+      ", Out of Bag Error:",round(h2o.confusionMatrix(rf1, valid = FALSE)[6,6],4)
+      )
+
+paste("Random Forest (model 2).",
+      "Accuracy:",round(h2o.hit_ratio_table(rf2, valid = TRUE)[1, 2],4),
+      ", Classification Error:",round(h2o.confusionMatrix(rf2, valid = TRUE)[6,6],4),
+      ", Out of Bag Error:",round(h2o.confusionMatrix(rf2, valid = FALSE)[6,6],4)
+)
+```
+We see improvements. Let's go farther with boosting.  
+
+### Gradiant Boosting 1
+
+With defaults: ntrees = 50, max_depth = 5, learn_rate = 0.01.   
+
+```{r boosting1}
+gbm1 <- h2o.gbm(
+	training_frame = train,
+	validation_frame = valid,
+	x = independant,
+	y = dependant,
+	model_id = "gbm_classe_v1",
+	seed = 2000000)
+```
+
+#### Performance  
+```{r gbm1_performance, echo = F}
+print("Reported on validation data")
+paste("Accuracy:",round(h2o.hit_ratio_table(gbm1, valid = TRUE)[1,2],4))
+paste("Classification Error:", round(h2o.confusionMatrix(gbm1, valid = TRUE)[6,6],4))
+```
+
+With defaults boosting performs even worse than our first random forest model. Let's improve it. 
+
+### Gradiant Boosting 2  
+
+1. learn_rate _ Increase the learning rate.  
+2. max_depth _ Adding depth makes each tree fit the data closer.
+
+```{r boosting2}
+gbm2 <- h2o.gbm(
+	training_frame = train,
+	validation_frame = valid,
+	x = independant,
+	y = dependant,
+	learn_rate = 0.3, # increase the learning rate
+	max_depth = 10,
+#	sample_rate = 0.7, # use a random 70% of the rows to fit each tree
+#	col_sample_rate = 0.7, # use 70% of the columns to fit each tree
+	stopping_rounds = 2,
+	stopping_tolerance = 0.01,
+	model_id = "gbm_classe_v2",
+	seed = 2000000
+)
+```
+
+#### Performance   
+```{r boosting2_performance, echo = F}
+print("Reported on validation data")
+paste("Accuracy:",round(h2o.hit_ratio_table(gbm2, valid = TRUE)[1,2],4))
+paste("Classification Error:", round(h2o.confusionMatrix(gbm2, valid = TRUE)[6,6],4))
+```
+
+This is an excellent result. We will stick to this second boosting model. 
+(By uncommenting the two commented lines in above model, the results will improve even more. Those two lines are adding some of the nature of random forest into the GBM).   
+
+## Prediction  
+
+We will predict the classe variable using the second boosting model.  
+```{r prediction}
+gbm2_pred <- h2o.predict(gbm2, newdata = test)
+paste("Test Set Accuracy:", round(mean(gbm2_pred$predict == test$classe),4))
+```
+
+## Expected Out of Sample Error  
+
+Expected out of sample error is (1 - accuracy(test)). So we expect an error equal to `r 1 - round(mean(gbm2_pred$predict == test$classe),4)`.  
+
+## Prediction on Unseen Data
+
+We also have testing set that we didn't touch so far (for this set we don't know the real classes).    
+```{r prediction_2_final}
+testing.h2o <- as.h2o(testing)
+gbm2_pred_final <- h2o.predict(gbm2, newdata = testing.h2o)
+gbm2_pred_final$predict
+```
+
+
+
+## Shut down H2o
+
+```{r h2o_shutdown}
+#h2o.shutdown(prompt = FALSE)             # shut down h2o instance
+```
+
+
+## Reference
+
+1. Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of Weight Lifting Exercises](http://web.archive.org/web/20170809020213/http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013
+
+2. [H2o Ensemble Tree](http://ethen8181.github.io/machine-learning/h2o/h2o_ensemble_tree/h2o_ensemble_tree.html)
+
+3. [Use H2O and data.table to build models on large data sets in R](https://www.analyticsvidhya.com/blog/2016/05/h2o-data-table-build-models-large-data-sets/)
